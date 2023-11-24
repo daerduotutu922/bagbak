@@ -3,7 +3,7 @@ import { mkdir, open, rm, rename } from 'fs/promises';
 import { tmpdir } from 'os';
 import { basename, join, resolve } from 'path';
 
-import { findEncryptedBinaries } from './lib/scan.js';
+import { AppBundleVisitor } from './lib/scan.js';
 import { Pull, quote } from './lib/scp.js';
 import { connect } from './lib/ssh.js';
 import { debug, directoryExists, readFromPackage } from './lib/utils.js';
@@ -42,8 +42,11 @@ export class BagBak extends EventEmitter {
     this.#app = app;
     this.#device = device;
 
-    if ('SSH_USERNAME' in process.env && 'SSH_PASSWORD' in process.env) {
+    if ('SSH_USERNAME' in process.env || 'SSH_PASSWORD' in process.env) {
       const { SSH_USERNAME, SSH_PASSWORD } = process.env;
+      if (!SSH_USERNAME || !SSH_PASSWORD)
+        throw new Error('You have to provide both SSH_USERNAME and SSH_PASSWORD');
+
       this.#auth = {
         username: SSH_USERNAME,
         password: SSH_PASSWORD
@@ -122,9 +125,10 @@ export class BagBak extends EventEmitter {
    * dump raw app bundle to directory (no ipa)
    * @param {import("fs").PathLike} parent path
    * @param {boolean} override whether to override existing files
+   * @param {boolean} abortOnError whether to abort on error
    * @returns {Promise<string>}
    */
-  async dump(parent, override = false) {
+  async dump(parent, override = false, abortOnError = false) {
     if (!await directoryExists(parent))
       throw new Error('Output directory does not exist');
 
@@ -139,10 +143,13 @@ export class BagBak extends EventEmitter {
 
     this.emit('sshBegin');
     await this.#copyToLocal(remoteRoot, parent);
+
     this.emit('sshFinish');
 
-    // find all encrypted binaries
-    const map = await findEncryptedBinaries(localRoot);
+    const visitor = new AppBundleVisitor(localRoot);
+    await visitor.removeUnwanted();
+    const map = await visitor.encryptedBinaries();
+
     debug('encrypted binaries', map);
     const agentScript = await readFromPackage('agent', 'tiny.js');
     /**
@@ -163,6 +170,8 @@ export class BagBak extends EventEmitter {
       try {
         pid = await this.#device.spawn(mainExecutable);
       } catch(e) {
+        if (abortOnError) throw e;
+
         console.error(`Failed to spawn executable at ${mainExecutable}, skipping...`);
         console.error(`Warning: Unable to dump ${dylibs.map(([path, _]) => path).join('\n')}`);
         continue;
@@ -177,6 +186,8 @@ export class BagBak extends EventEmitter {
       try {
         session = await this.#device.attach(pid);
       } catch(e) {
+        if (abortOnError) throw e;
+
         console.error(`Failed to attach to pid ${pid}, skipping...`);
         console.error(`Warning: Unable to dump ${dylibs.map(([path, _]) => path).join('\n')}`);
         continue;
